@@ -1,0 +1,699 @@
+#!/usr/bin/env python
+
+# File: gtranslate
+#
+#  Copyright (C) 2013 David Hauweele <david@hauweele.net>
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU General Public License as published by
+#  the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU General Public License for more details.
+#
+#  You should have received a copy of the GNU General Public License
+#  along with this program. If not, see <http://www.gnu.org/licenses/>.
+
+import os
+import sys
+import getopt
+import signal
+import threading
+import Queue
+import subprocess
+import ConfigParser as cp
+
+from gtranslate_const import *
+
+import gi
+gi.require_version("Gtk", "3.0")
+
+from gi.repository import Gtk, Gdk, GdkPixbuf, GObject, Pango
+
+def show_message(message_type, message, exit_code = None):
+    if message_type == "error":
+        gtk_message_type = Gtk.MessageType.ERROR
+    elif message_type == "warning":
+        gtk_message_type = Gtk.MessageType.WARNING
+
+    print >> sys.stderr, "%s: %s" % (message_type, message)
+
+    dialog = Gtk.MessageDialog(None,
+                               Gtk.DialogFlags.MODAL | Gtk.DialogFlags.DESTROY_WITH_PARENT,
+                               gtk_message_type,
+                               Gtk.ButtonsType.OK,
+                               message)
+    dialog.set_position(Gtk.WindowPosition.MOUSE)
+    dialog.run()
+    dialog.destroy()
+
+    if exit_code != None:
+        sys.exit(exit_code)
+
+def error(exit_code, message):
+    show_message("error", message, exit_code)
+
+def warning(message):
+    show_message("warning", message)
+
+def str_to_bool(s):
+    s = s.lower()
+    s = s.strip()
+    if s in ("true", "#t", "1", "yes", "y", "t"):
+        return True
+    return False
+
+def gtk_text_buffer_get_all_text(buffer):
+    return buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
+
+def search_dts(file, select, default=None):
+    """ Search in . ~ / (dot, tilde, slash) for a file in this order and return a path to the file. """
+
+    # This forces the non-portability.
+    dot    = file
+    tilde  = os.path.join(os.environ["HOME"], PKG_CONFIG, file)
+    slash  = os.path.join(PKG_SHARE, file)
+
+    if 'd' in select and os.path.isfile(dot):
+        return dot
+    elif 't' in select and os.path.isfile(tilde):
+        return tilde
+    elif 's' in select and os.path.isfile(slash):
+        return slash
+
+    if default:
+        if default == 'd':
+            return dot
+        elif default == 't':
+            return tilde
+        elif default == 's':
+            return slash
+
+    return None
+
+class ExitItem(): pass
+
+class Qthread(threading.Thread):
+    """ This class specify a thread and his waiting queue """
+
+    def __init__(self, process, maxsize, thread_name):
+        """
+        @param maxsize The maximal size of the queue
+        @param process A function with one argument that process an element from the queue """
+
+        threading.Thread.__init__(self, group = None,
+                                  target = None,
+                                  name   = thread_name,
+                                  args   = (),
+                                  kwargs = {})
+
+        self.queue      = Queue.Queue(maxsize)
+        self.process    = process
+
+        self.setDaemon(True)
+
+    def qsize(self):
+        """ return the size of the waiting queue """
+
+        return self.queue.qsize()
+
+    def run(self):
+        """ this function process elements in the waiting queue """
+
+        exit_bool = False
+        while not exit_bool:
+            job = self.queue.get()
+
+            # if we ask to leave, we process what is left from the waiting queue
+            # and break out the loop.
+            if job == ExitItem:
+                exit_bool = True
+                self.queue.task_done()
+                continue
+
+            # process a standard element
+            self.process(job)
+            self.queue.task_done()
+
+    def put(self, job):
+        """ put a job on the waiting queue ; this call may block if the queue is full """
+
+        self.queue.put(job)
+
+    def put_nowait(self, job):
+        """ put a job on the waiting queue ; this call never block but generate an exception
+            when the queue is full """
+
+        self.queue.put_nowait(job)
+
+    def exit(self):
+        """ ask to the thread to leave ; this call is blocking if the queue is full.
+            you may call join just after this call. """
+
+        # tout ce qu'on doit faire c'est signaler par la file d'attente
+        self.queue.put(ExitItem)
+
+class Processus():
+    def __init__(self, args, callback_ok, callback_timeout, callback_error, callback_oserror, timeout = 0, kill_on_timeout = True, data = None):
+        self.args     = args
+        self.data = data
+        self.timeout = timeout
+        self.kill_on_timeout = kill_on_timeout
+        self.callback_ok      = callback_ok
+        self.callback_timeout = callback_timeout
+        self.callback_error   = callback_error
+        self.callback_oserror = callback_oserror
+
+        self.killed = False
+
+        self.thread = threading.Thread(target = self.run)
+        self.thread.start()
+
+    def wait(self):
+        # This is a portable (and easier than signals) way to use a timeout with subprocesses.
+        self.thread.join(self.timeout)
+        if self.thread.is_alive():
+            self.kill()
+            self.thread.join()
+            self.callback_timeout()
+
+    def run(self):
+        try:
+            self.p = subprocess.Popen(self.args, shell = False, stdout = subprocess.PIPE, stderr = subprocess.PIPE, env = os.environ, preexec_fn=os.setpgrp)
+        except OSError:
+            self.callback_oserror()
+            return
+
+        stdout, stderr = self.p.communicate()
+
+        if self.p.returncode != 0 and not self.killed:
+            self.callback_error()
+        elif not self.killed:
+            self.callback_ok(stdout, stderr, self.data)
+        self.killed = True
+
+    def kill(self):
+        if not self.killed:
+            self.killed = True
+
+            # Kill the whole child tree
+            os.killpg(self.p.pid, signal.SIGKILL)
+
+class Translation():
+    """ This structure class represent a translation job. """
+
+    def __init__(self, src_lang, dst_lang, src_text, dst_buffer):
+        self.src_lang   = src_lang
+        self.dst_lang   = dst_lang
+        self.src_text   = src_text
+        self.dst_buffer = dst_buffer
+
+class GTranslate:
+    def __init__(self, tool, font, timeout):
+        # FIXME: We could just use a signal instead of a full waiting queue.
+        self.qthread = Qthread(self.translate_process, 8, "process-queue")
+        self.qthread.start()
+
+        self.tool    = tool
+        self.timeout = timeout
+
+        self.process = None
+
+        # create the configuration directory
+        self.create_tilde()
+
+        # we use GtkBuilder to build our interface
+        try:
+            builder = Gtk.Builder()
+            builder.add_from_file(search_dts("gtranslate.ui", 'ds', default='s'))
+        except:
+            error(1, "Failed to load UI file.")
+
+        # get the widgets
+        self.window = builder.get_object("window")
+        self.toolbar      = builder.get_object("toolbar")
+        self.left_button  = builder.get_object("translate_to_left")
+        self.right_button = builder.get_object("translate_to_right")
+        self.left_text    = builder.get_object("left_text")
+        self.right_text   = builder.get_object("right_text")
+        self.left_lang  = builder.get_object("left_lang")
+        self.right_lang = builder.get_object("right_lang")
+        self.left_buffer = builder.get_object("left_buffer")
+        self.right_buffer = builder.get_object("right_buffer")
+        self.disable_toolbar = builder.get_object("disable_toolbar")
+        self.about_dialog = builder.get_object("about_dialog")
+        self.status = builder.get_object("status")
+
+        # we have to connect this event manually
+        self.window.connect("key-press-event", self.on_press_event)
+
+        # load the configuration
+        self.cfg = Configuration(search_dts("configuration", 't', 't'))
+
+        # setup icon
+        self.setup_icon(search_dts("gtranslate.png", 'ds', 's'))
+
+        # setup toolbar
+        self.setup_toolbar()
+
+        # setup tool
+        self.setup_tool()
+
+        # setup timeout
+        self.setup_timeout()
+
+        # setup fonts
+        self.setup_font([self.left_text, self.right_text], font)
+
+        # populate languages
+        self.populate_lang([self.left_lang, self.right_lang], search_dts("languages.list", 'dts', default='s'))
+
+        # setup text buffers
+        self.setup_text([self.left_buffer, self.right_buffer])
+
+        # initialize status
+        self.status.set_text(version())
+
+        # connect signals
+        builder.connect_signals(self)
+
+    def main(self):
+        self.window.show()
+
+        GObject.threads_init()
+        Gdk.threads_init()
+
+        # Setup the signals
+        self.setup_signals()
+
+        Gdk.threads_enter()
+        Gtk.main()
+        Gdk.threads_leave()
+
+    def setup_icon(self, file):
+        try:
+            self.window.set_icon_from_file(file)
+            self.about_dialog.set_logo(GdkPixbuf.Pixbuf.new_from_file(file))
+            self.about_dialog.set_position(Gtk.WindowPosition.MOUSE)
+        except:
+            error(1, "Cannot setup the application icon.")
+
+    def setup_toolbar(self):
+        enable = self.cfg.get("gui", "toolbar", "str")
+        self.toolbar_switch = str_to_bool(enable)
+
+        if not self.toolbar_switch:
+            self.toolbar.set_visible(False)
+
+    def setup_signals(self):
+        # FIXME: We should exit gracefully instead.
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    def setup_timeout(self):
+        if self.timeout == None:
+            self.timeout = self.cfg.get("tool", "timeout", "int")
+
+            try:
+                self.timeout = int(self.timeout)
+            except ValueError:
+                error(1, "Cannot parse the timeout from the configuration file.")
+
+    def setup_text_from(self, buffer, file):
+        if not file:
+            return
+
+        try:
+            f = open(file, 'r')
+            text = f.read()
+            f.close()
+        except:
+            return
+
+        buffer.set_text(text)
+
+    def setup_text(self, buffer_list):
+        self.setup_text_from(buffer_list[0], search_dts("left-buffer.last", 't', 't'))
+        self.setup_text_from(buffer_list[1], search_dts("right-buffer.last", 't', 't'))
+
+    def setup_tool(self):
+        if self.tool == None:
+            self.tool = self.cfg.get("tool", "path", "str")
+
+    def setup_font(self, widget_list, font):
+        # setup the font
+        font_desc_string = self.cfg.get("gui", "font", "str")
+        font_desc_string = font_desc_string.strip()
+
+        if font != None:
+            font_desc_string = font
+
+        if font_desc_string != "":
+            font_desc = Pango.FontDescription(font_desc_string)
+            for widget in widget_list:
+                widget.modify_font(font_desc)
+
+    def create_tilde(self):
+        tilde  = os.path.join(os.environ["HOME"], PKG_CONFIG)
+        if not os.path.isdir(tilde):
+            try:
+                os.mkdir(tilde)
+            except:
+                print >>sys.stderr, "error: Cannot create the configuration directory."
+                sys.exit(1)
+
+    def setup_last_lang(self, combo, lang, items):
+        lang = lang.strip()
+        if lang in items:
+            combo.set_active(items[lang])
+
+    def populate_lang(self, combo_list, file):
+        try:
+            f = open(file, "r")
+        except:
+            error(1, "Failed to load languages file.")
+
+        # We use this to load the last language just after initializing the comboboxes.
+        # Paticularly we use this to map the name of the last lang used to the current
+        # position in the combo box.
+        items = {}
+
+        i = 0
+        for line in f:
+            line = line.strip()
+            desc = line.split(' ')
+
+            if len(desc) != 2:
+                error(1, "Invalid languages file.")
+
+            items[desc[0]] = i
+
+            i += 1
+
+            map(lambda c : c.append_text(desc[0] + " (" + desc[1] + ")"), combo_list)
+
+        f.close()
+
+        # Load the last used languages.
+        self.setup_last_lang(combo_list[0], self.cfg.get("language", "left", "str"), items)
+        self.setup_last_lang(combo_list[1], self.cfg.get("language", "right", "str"), items)
+
+    def extract_lang(self, text):
+        text    = text.split(' ')
+        text[1] = text[1].strip('()')
+        return text
+
+    def translate(self, src_lang, dst_lang, src_buffer, dst_buffer):
+        src_lang = src_lang.get_active_text()
+        dst_lang = dst_lang.get_active_text()
+
+        src_text = gtk_text_buffer_get_all_text(src_buffer)
+        src_text = src_text.strip()
+
+        if src_lang == None:
+            warning("The source language is not selected.")
+            return
+        elif dst_lang == None:
+            warning("The destination language is not selected.")
+            return
+        elif src_lang == dst_lang:
+            warning("The source language and destination language are the same")
+            return
+        elif len(src_text) == 0:
+            warning("Nothing to translate.")
+            return
+
+        src_lang = self.extract_lang(src_lang)
+        dst_lang = self.extract_lang(dst_lang)
+
+        self.status.set_text("Translate from " + src_lang[1] + " to " + dst_lang[1] + "...")
+
+        self.set_sensitive(False)
+        self.qthread.put(Translation(src_lang[0], dst_lang[0], src_text, dst_buffer))
+
+    def translate_process(self, translation):
+        self.process = Processus([self.tool, translation.src_lang, translation.dst_lang, translation.src_text],
+                                 self.on_process_ok,
+                                 self.on_process_timeout,
+                                 self.on_process_error,
+                                 self.on_process_oserror,
+                                 timeout = self.timeout,
+                                 kill_on_timeout = True,
+                                 data = translation.dst_buffer)
+        self.process.wait()
+
+    def set_sensitive(self, sensitive):
+        for button in (self.left_button, self.right_button, self.left_text, self.right_text):
+            button.set_sensitive(sensitive)
+
+    def combo_last_lang(self, combo):
+        lang = combo.get_active_text()
+        if lang == None:
+            return ""
+        lang = lang.split(' ')
+        return lang[0]
+
+    def save_font(self):
+        self.cfg.set("gui", "font", self.left_text.get_style().font_desc.to_string())
+
+    def save_timeout(self):
+        self.cfg.set("tool", "timeout", str(self.timeout))
+
+    def save_languages(self, combo_list):
+        self.cfg.set("language", "left", self.combo_last_lang(combo_list[0]))
+        self.cfg.set("language", "right", self.combo_last_lang(combo_list[1]))
+
+    def save_text_into(self, buffer, file):
+        text = gtk_text_buffer_get_all_text(buffer)
+        text = text.strip()
+
+        try:
+            f = open(file, 'w')
+            f.write(text)
+            f.close()
+        except:
+            error(1, "Cannot save the text buffers.")
+
+    def save_text(self, buffer_list):
+        self.save_text_into(buffer_list[0], search_dts("left-buffer.last", 't', 't'))
+        self.save_text_into(buffer_list[1], search_dts("right-buffer.last", 't', 't'))
+
+    def save_tool(self):
+        self.cfg.set("tool", "path", self.tool)
+
+    def save_toolbar(self):
+        if self.toolbar_switch:
+            self.cfg.set("gui", "toolbar", "true")
+        else:
+            self.cfg.set("gui", "toolbar", "false")
+
+    def quit(self):
+        self.save_toolbar()
+        self.save_font()
+        self.save_timeout()
+        self.save_tool()
+        self.save_languages([self.left_lang, self.right_lang])
+        self.save_text([self.left_buffer, self.right_buffer])
+        self.cfg.save()
+
+        if self.process:
+            self.process.kill()
+        self.qthread.exit()
+        self.qthread.join()
+
+        Gtk.main_quit()
+
+        sys.exit(0)
+
+
+    def on_process_timeout(self):
+        Gdk.threads_enter()
+
+        self.status.set_text("Translation timeout!")
+        warning("Translation request timeout. Is internet enabled ?")
+        self.set_sensitive(True)
+
+        Gdk.threads_leave()
+
+    def on_process_error(self):
+        Gdk.threads_enter()
+
+        self.status.set_text("Translation process error!")
+        warning("Translation process error. The process returned an error.")
+        self.set_sensitive(True)
+
+        Gdk.threads_leave()
+
+    def on_process_oserror(self):
+        Gdk.threads_enter()
+
+        self.status.set_text("Translation executable does not exist!")
+        warning("Translation process error. The executable does not exist.")
+        self.set_sensitive(True)
+
+        Gdk.threads_leave()
+
+    def on_process_ok(self, stdout, stderr, data = None):
+        Gdk.threads_enter()
+
+        stdout = stdout.strip()
+        data.set_text(stdout)
+        self.status.set_text("Translation OK!")
+        self.set_sensitive(True)
+
+        Gdk.threads_leave()
+
+    def on_destroy(self, data = None):
+        self.quit()
+
+    def on_press_event(self, widget, event, data = None):
+        if event.type == Gdk.EventType.KEY_PRESS:
+            keyname = Gdk.keyval_name(event.keyval)
+            if keyname == "F12":
+                self.on_disable_toolbar(None, None)
+
+    def on_font(self, button, data = None):
+        dialog = Gtk.FontChooserDialog("Choose a font", self.window)
+
+        font_desc = self.left_text.get_style().font_desc
+        dialog.set_font_desc(font_desc)
+
+        result = dialog.run()
+
+        if result == Gtk.ResponseType.OK:
+            font_desc = dialog.get_font_desc()
+            self.left_text.modify_font(font_desc)
+            self.right_text.modify_font(font_desc)
+
+        dialog.destroy()
+
+    def on_about(self, button, data = None):
+        self.about_dialog.show()
+
+    def on_about_close(self, button, data = None):
+        self.about_dialog.hide()
+
+    def on_swap(self, button, data = None):
+        left_text  = gtk_text_buffer_get_all_text(self.left_buffer)
+        right_text = gtk_text_buffer_get_all_text(self.right_buffer)
+
+        self.left_buffer.set_text(right_text)
+        self.right_buffer.set_text(left_text)
+
+    def on_disable_toolbar(self, button, data = None):
+        self.toolbar_switch = not self.toolbar_switch
+        self.toolbar.set_visible(self.toolbar_switch)
+
+    def on_translate_to_left(self, button, data = None):
+        self.translate(self.right_lang, self.left_lang, self.right_buffer, self.left_buffer)
+
+    def on_translate_to_right(self, button, data = None):
+        self.translate(self.left_lang, self.right_lang, self.left_buffer, self.right_buffer)
+
+    def on_left_lang(self, combo, data = None):
+        lang = combo.get_active_text()
+        lang = self.extract_lang(lang)
+        self.status.set_text("Switch left language to " + lang[1])
+
+    def on_right_lang(self, combo, data = None):
+        lang = combo.get_active_text()
+        lang = self.extract_lang(lang)
+        self.status.set_text("Switch right language to " + lang[1])
+
+class Configuration(cp.ConfigParser):
+    """ Load and save the """
+    def __init__(self, file):
+        cp.ConfigParser.__init__(self)
+
+        self.file = file
+
+        try:
+            self.read(file)
+        except:
+            error(1, "Cannot parse the configuration file.")
+            return
+
+        if not self.has_section("language"):
+            self.add_section("language")
+        if not self.has_section("gui"):
+            self.add_section("gui")
+        if not self.has_section("tool"):
+            self.add_section("tool")
+
+        if not self.has_option("language", "left"):
+            self.set("language", "left", "")
+        if not self.has_option("language", "right"):
+            self.set("language", "right", "")
+        if not self.has_option("tool", "timeout"):
+            self.set("tool", "timeout", "10")
+        if not self.has_option("tool", "path"):
+            self.set("tool", "path", PKG_LIB_SH + "/translate.sh")
+        if not self.has_option("gui", "font"):
+            self.set("gui", "font", "")
+        if not self.has_option("gui", "toolbar"):
+            self.set("gui", "toolbar", "true")
+
+    def save(self):
+        try:
+            f = open(self.file, 'w')
+            self.write(f)
+            f.close()
+        except:
+            error(1, "Cannot save the configuration file.")
+
+def version():
+    return PKG_NAME + " v" + PKG_VERSION + " by " + PKG_AUTHOR + " " + PKG_AUTHOR_EMAIL
+
+def usage():
+    print ""
+    print "Usage: %s [OPTIONS]" % (sys.argv[0])
+    print ""
+    print "\t-V, --version Show the version and quit."
+    print "\t-h, --help    Show this help message and quit."
+    print "\t-t, --tool    Choose the tool to use for translation."
+    print "\t-f, --font    Change the default font."
+    print "\t-t, --timeout Change the timeout for the translate tool."
+
+if __name__ == "__main__":
+    tool     = None
+    font     = None
+    timeout  = None
+
+    if "TRANSLATE_TOOL" in os.environ.keys():
+        tool = os.environ["TRANSLATE_TOOL"]
+
+    try:
+        opts, args = getopt.getopt(sys.argv[1:], "hVt:f:t",
+                                   [ "help",
+                                     "version",
+                                     "tool=",
+                                     "font=",
+                                     "timeout=" ])
+    except getopt.GetoptError, e:
+        print str(e)
+        usage()
+        sys.exit(1)
+
+    for o, a in opts:
+        if o in ('-h', '--help'):
+            print version()
+            usage()
+            sys.exit(0)
+        elif o in ('-V', '--version'):
+            print version()
+            sys.exit(0)
+        elif o in ('-t', '--tool'):
+            tool = a
+        elif o in ('-f', '--font'):
+            font = a
+        elif o in ('-t', '--timeout'):
+            try:
+                timeout = int(a)
+            except ValueError:
+                print >> sys.stderr, "error: cannot parse timeout"
+                sys.exit(1)
+
+    app = GTranslate(tool, font, timeout)
+    app.main()

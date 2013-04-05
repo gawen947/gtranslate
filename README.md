@@ -1,4 +1,4 @@
-gtranslate
+GTranslate
 ==========
 
-A quick interface to tranlsation tools.
+A quick interface to translation tools.
