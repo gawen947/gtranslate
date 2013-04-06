@@ -26,8 +26,9 @@ Installation
 
 Simply run:
 
-  $ sudo python setup.py install
+> sudo python setup.py install
 
 If the translaboob command from weboob is configured then it should work out of the box.
 Otherwise you could either change the wrapper script in /usr/local/lib/sh/translate.sh or
 change the translation tool with the --translate option or TRANSLATE_TOOL environnement variable.
+
